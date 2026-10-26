@@ -1,0 +1,7 @@
+&led_matrix {
+    status = "disabled";
+};
+
+&lsm303agr_magn {
+    status = "disabled";
+};

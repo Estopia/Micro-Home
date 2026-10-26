@@ -1,0 +1,63 @@
+substitutions:
+  microbit_mac: "C0:00:00:00:00:01"
+
+esphome:
+  name: microbit-gateway
+  friendly_name: Microbit Gateway
+  min_version: 2026.10.0
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [bthome]
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+logger:
+  level: DEBUG
+  logs:
+    bthome: DEBUG
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: false
+    interval: 320ms
+    window: 300ms
+    continuous: true
+
+bthome:
+  id: microbit
+  mac_address: ${microbit_mac}
+  stale_timeout: 30s
+
+sensor:
+  - platform: bthome
+    bthome_id: microbit
+    temperature:
+      name: "Microbit Die Temperature"
+    acceleration:
+      name: "Microbit Total Acceleration"
+
+binary_sensor:
+  - platform: bthome
+    bthome_id: microbit
+    button:
+      name: "Microbit Button A"
+      filters:
+        - delayed_on_off: 30ms

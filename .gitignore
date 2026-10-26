@@ -1,0 +1,5 @@
+.esphome/
+.venv/
+__pycache__/
+secrets.yaml
+firmware/build/
