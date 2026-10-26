@@ -3,5 +3,5 @@
 };
 
 &lsm303agr_magn {
-    status = "disabled";
+    status = "okay";
 };

@@ -12,6 +12,7 @@ from . import BTHomeHub, CONF_BTHOME_ID
 
 DEPENDENCIES = ["bthome"]
 CONF_ACCELERATION = "acceleration"
+CONF_HEADING = "heading"
 
 CONFIG_SCHEMA = cv.Schema(
     {
@@ -28,6 +29,12 @@ CONFIG_SCHEMA = cv.Schema(
             icon="mdi:axis-arrow",
             state_class=STATE_CLASS_MEASUREMENT,
         ),
+        cv.Optional(CONF_HEADING): sensor.sensor_schema(
+            unit_of_measurement="\u00b0",
+            accuracy_decimals=2,
+            icon="mdi:compass",
+            state_class=STATE_CLASS_MEASUREMENT,
+        ),
     }
 )
 
@@ -40,3 +47,6 @@ async def to_code(config):
     if CONF_ACCELERATION in config:
         entity = await sensor.new_sensor(config[CONF_ACCELERATION])
         cg.add(hub.set_acceleration(entity))
+    if CONF_HEADING in config:
+        entity = await sensor.new_sensor(config[CONF_HEADING])
+        cg.add(hub.set_heading(entity))

@@ -2,7 +2,8 @@
 
 Zephyr C++ transmitter and ESP32 passive BLE receiver. No pairing, GATT
 connection, SoftDevice or Bluetooth proxy is involved. Add the ESP32 to Home
-Assistant through the ESPHome integration to discover the three entities.
+Assistant through the ESPHome integration to discover temperature, total
+acceleration, Button A, Button B and magnetic compass heading.
 
 ## Compatibility
 
@@ -29,23 +30,27 @@ Implementation: [firmware/src/main.cpp](firmware/src/main.cpp), configuration:
 
 ### Exact advertising bytes
 
-Example: 25.00 degrees C, Button A held, total acceleration 9.807 m/s^2:
+Example: 25.00 degrees C, A held, B released, acceleration 9.807 m/s^2,
+magnetic heading 90.00 degrees:
 
 ```text
-02 01 06  0C 16 D2 FC 40  02 C4 09  0F 01  51 4F 26
+02 01 06  11 16 D2 FC 40  02 C4 09  0F 01  0F 00  51 4F 26  5E 28 23
 ```
 
 | Bytes | Meaning |
 | --- | --- |
 | `02 01 06` | Flags AD: length 2, type 0x01, General Discoverable + no BR/EDR |
-| `0C 16` | Service-data AD: 12 following bytes including type 0x16 |
+| `11 16` | Service-data AD: 17 following bytes including type 0x16 |
 | `D2 FC` | BTHome service UUID 0xFCD2, little-endian |
 | `40` | Version 2; unencrypted; regular updates; reserved bits zero |
 | `02 C4 09` | Temperature object 0x02; signed LE int16 2500, factor 0.01 |
 | `0F 01` | Generic boolean object 0x0F; Button A pressed=1, released=0 |
+| `0F 00` | Second generic boolean; Button B pressed=1, released=0 |
 | `51 4F 26` | Acceleration object 0x51; unsigned LE uint16 9807, factor 0.001 |
+| `5E 28 23` | Direction object 0x5E; unsigned LE uint16 9000, factor 0.01 degree |
 
-Object IDs are ascending. The entire advertisement is **16 bytes**, below the
+Object IDs are non-decreasing. Repeated booleans are always A then B.
+The entire advertisement is **21 bytes**, below the
 legacy BLE 31-byte limit. There is no optional packet-ID object (0x00),
 encryption counter or MIC. Device info 0x40 does not itself encode a counter flag.
 The encoder explicitly constructs both AD elements; the firmware gives their
@@ -64,13 +69,23 @@ No 0x3A events are transmitted by this implementation.
   copies improve reception; this is not Bluetooth periodic advertising.
 - Advertising stops between bursts. `k_msleep()` and the tickless idle kernel
   allow CPU System ON idle sleep, not busy waiting or System OFF. The 1 Hz
-  accelerometer remains enabled; the LED matrix and magnetometer are disabled.
-- Button GPIO is active-low and converted to logical pressed/released by Zephyr.
+  accelerometer and magnetometer remain enabled; the LED matrix is disabled.
+- Both button GPIOs are active-low and converted to logical pressed/released by Zephyr.
   Two matching readings 25 ms apart debounce each sample. A bouncing sample is
   skipped. **Taps entirely between samples are not captured**; this is a periodic
   state monitor, not a reliable click-event transport. BLE delivery is best effort.
 - Total acceleration is `sqrt(ax*ax + ay*ay + az*az)` in m/s^2, including gravity:
   approximately 9.81 at rest, not zero. The accelerometer range is +/-4 g per axis.
+- Compass heading is `atan2(-mag_y, mag_x)`, normalised to 0-359.99 degrees.
+  It describes the magnetometer's +X axis relative to **magnetic**, not true, north.
+  Hold the board level: this is a two-axis compass, **not tilt compensated**.
+  No claim is made that the reference axis is the printed top edge of the board.
+  Keep away from magnets, speakers, steel and high-current wiring. Defaults are
+  uncalibrated. For basic hard-iron correction, measure each magnetic axis's
+  minimum and maximum during a full level rotation and set
+  `MAGNETIC_X_OFFSET_GAUSS` and `MAGNETIC_Y_OFFSET_GAUSS` in the firmware to
+  `(maximum + minimum) / 2`, in gauss, then rebuild. Soft-iron distortion requires
+  additional calibration; declination and tilt compensation are not implemented.
 - Temperature is the **nRF die temperature**, not a calibrated ambient sensor.
   Native resolution is 0.25 degrees C; encoding at 0.01 does not improve it.
   Calibrate against a reference in the intended enclosure if necessary.
@@ -82,14 +97,14 @@ No 0x3A events are transmitted by this implementation.
 Use an activated Python virtual environment with `west`, `cmake==3.31.6`, `ninja`
 and Zephyr's `scripts/requirements-base.txt` installed. Initialise a Zephyr
 workspace at tag `v4.2.0` using the [official setup guide](https://docs.zephyrproject.org/4.2.0/develop/getting_started/index.html).
-For this application the required manifest projects are `hal_nordic`, `cmsis`
-and `cmsis_6`; installing all manifest projects is also supported.
+For this application the required manifest projects are `hal_nordic`, `hal_st`,
+`cmsis` and `cmsis_6`; installing all manifest projects is also supported.
 
 From the Zephyr workspace, install the SDK once:
 
 ```sh
 export ZEPHYR_BASE="$PWD/zephyr"
-west update --narrow -o=--depth=1 hal_nordic cmsis cmsis_6
+west update --narrow -o=--depth=1 hal_nordic hal_st cmsis cmsis_6
 west sdk install --version 0.17.2 --toolchains arm-zephyr-eabi --install-dir "$HOME/zephyr-sdk-0.17.2"
 export ZEPHYR_SDK_INSTALL_DIR="$HOME/zephyr-sdk-0.17.2"
 ```
@@ -156,10 +171,17 @@ gaps. No pairing or connection to the micro:bit is attempted.
 
 Entities are packet-driven: no polling `update_interval` applies. Updates are
 expected approximately every 5 seconds; lost bursts can make that longer.
-The button has an additional 30 ms ESPHome `delayed_on_off` filter. After 30
-seconds without a valid packet, numeric values become NaN and Button A's state
-is invalidated rather than retaining a stale pressed/released state indefinitely.
+Both buttons have an additional 30 ms ESPHome `delayed_on_off` filter. After 30
+seconds without a valid packet, numeric values become NaN and both button states
+are invalidated rather than retaining stale pressed/released states indefinitely.
 This marks entity data unknown, not the whole ESPHome node offline.
+
+Upload the updated receiver component and YAML as well as flashing the transmitter:
+the old receiver rejects the extended payload. The new receiver still accepts the
+original one-button, no-compass packets; Button B and heading remain unknown for
+those packets. The existing `button:` YAML key continues to mean Button A;
+`button_b:` adds B and `heading:` adds the compass. The ESP32-C3 configuration in
+[real.yaml](real.yaml) preserves its DHT sensor alongside these entities.
 
 ### MQTT alternative
 
@@ -190,11 +212,13 @@ security-critical decisions; anyone nearby can read or spoof the advertisements.
   starts `40 02`. Some versions display the full 128-bit base UUID. iOS does not
   expose a peripheral's actual BLE MAC; use micro:bit serial or ESPHome logs for
   MAC matching, not iOS's peripheral identifier.
-- At the example values, service data is `40 02 C4 09 0F 01 51 4F 26` when the
+- At the example values, service data is `40 02 C4 09 0F 01 0F 00 51 4F 26 5E 28 23` when the
   app displays UUID separately, or `D2 FC` followed by those bytes otherwise.
-  Ensure the service-data AD length is `0C`, not `0B`. Check changing orientation,
-  temperature and holding/releasing A across successive five-second samples.
-- Look for `[bthome] Accepted V2 packet: temperature=... button=... acceleration=... RSSI=...`.
+  Ensure the service-data AD length is `11`. Hold A and B separately and together
+  across successive five-second samples. Rotate level away from metal and check
+  that heading changes smoothly and wraps at north; compare against a reference
+  compass only after calibrating the magnetic offsets and reference-axis alignment.
+- Look for `[bthome] Accepted V2 packet: temperature=... button_a=... button_b=... acceleration=... heading=... extended=1 RSSI=...`.
   Raise global logger level to `VERY_VERBOSE` and `bthome` to `VERBOSE` temporarily
   for the configured-MAC/no-service-data diagnostic. For general discovery use
   `esp32_ble_tracker: DEBUG` under `logger.logs` (global level at least DEBUG).
@@ -202,10 +226,11 @@ security-critical decisions; anyone nearby can read or spoof the advertisements.
   upstream BTHome logs:
 
 ```text
-Dropped BTHome packet: invalid service-data length (expected 9 bytes after UUID)
+Dropped BTHome packet: invalid service-data length (expected 14 or legacy 9 bytes after UUID)
 Dropped BTHome packet: unsupported device info (expected unencrypted V2 0x40)
-Dropped BTHome packet: unexpected object layout (expected 02,0F,51)
+Dropped BTHome packet: unexpected object layout (expected 02,0F,0F,51,5E or legacy 02,0F,51)
 Dropped BTHome packet: invalid boolean (expected 0 or 1)
+Dropped BTHome packet: invalid heading (expected 0 through 35999 centidegrees)
 No valid BTHome packet within stale_timeout; readings unknown
 ```
 
@@ -227,10 +252,12 @@ g++ -std=c++17 -Wall -Wextra -Werror -pedantic -fsanitize=address,undefined -I. 
 /tmp/microbit-bthome-test
 ```
 
-Verified locally: protocol tests, ESPHome 2026.10.0 schema/code generation and
-full ESP32 compilation, plus Zephyr 4.2.0 micro:bit cross-compilation. A successful
-build is not production certification: physical flashing, on-air interoperability,
-Home Assistant state transitions, RF-loss behaviour and whole-board current must
-be verified on the intended hardware before production use.
+Verified locally: protocol/compass tests, ESPHome 2026.10.0 schema/code generation,
+full ESP32-C3 compilation, and Zephyr 4.2.0 debug/battery cross-compilation.
+The connected micro:bit has been flashed and an actual extended BLE packet with
+both buttons and heading was received at MAC `FF:5A:28:C6:79:20`.
+The ESP32 has not been uploaded in this step. Home Assistant state transitions,
+physical button transitions, calibrated heading accuracy, RF-loss behaviour and
+whole-board current still require verification before production use.
 
 Protocol reference: [BTHome V2 format](https://bthome.io/format/).

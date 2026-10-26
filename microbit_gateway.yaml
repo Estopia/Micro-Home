@@ -53,11 +53,17 @@ sensor:
       name: "Microbit Die Temperature"
     acceleration:
       name: "Microbit Total Acceleration"
+    heading:
+      name: "Microbit Compass Heading"
 
 binary_sensor:
   - platform: bthome
     bthome_id: microbit
     button:
       name: "Microbit Button A"
+      filters:
+        - delayed_on_off: 30ms
+    button_b:
+      name: "Microbit Button B"
       filters:
         - delayed_on_off: 30ms

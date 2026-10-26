@@ -1,5 +1,6 @@
 // Toolchain: Zephyr v4.2.0 SDK, board bbc_microbit_v2/nrf52833 (not MicroPython).
 #include "protocol.h"
+#include "compass.h"
 
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/device.h>
@@ -19,10 +20,14 @@ LOG_MODULE_REGISTER(microbit_bthome, LOG_LEVEL_INF);
 
 static const device *const temperature_sensor = DEVICE_DT_GET(DT_NODELABEL(temp));
 static const device *const accelerometer = DEVICE_DT_GET(DT_ALIAS(accel0));
+static const device *const magnetometer = DEVICE_DT_GET(DT_ALIAS(magn0));
 static const gpio_dt_spec button_a = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
+static const gpio_dt_spec button_b = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
 
 static constexpr int64_t SAMPLE_PERIOD_MS = 5000;
 static constexpr int64_t BURST_MS = 600;
+static constexpr double MAGNETIC_X_OFFSET_GAUSS = 0.0;
+static constexpr double MAGNETIC_Y_OFFSET_GAUSS = 0.0;
 
 static int initialise_identity() {
   bt_addr_le_t identity{};
@@ -39,6 +44,7 @@ static int initialise_identity() {
 static int sample(microbit_bthome::Reading &reading) {
   sensor_value temperature{};
   sensor_value axes[3]{};
+  sensor_value magnetic_axes[3]{};
   int error = sensor_sample_fetch(temperature_sensor);
   if (error != 0)
     return error;
@@ -51,15 +57,27 @@ static int sample(microbit_bthome::Reading &reading) {
   error = sensor_channel_get(accelerometer, SENSOR_CHAN_ACCEL_XYZ, axes);
   if (error != 0)
     return error;
+  error = sensor_sample_fetch(magnetometer);
+  if (error != 0)
+    return error;
+  error = sensor_channel_get(magnetometer, SENSOR_CHAN_MAGN_XYZ, magnetic_axes);
+  if (error != 0)
+    return error;
 
   const int first = gpio_pin_get_dt(&button_a);
   if (first < 0)
     return first;
+  const int first_b = gpio_pin_get_dt(&button_b);
+  if (first_b < 0)
+    return first_b;
   k_msleep(25);
   const int second = gpio_pin_get_dt(&button_a);
   if (second < 0)
     return second;
-  if (first != second)
+  const int second_b = gpio_pin_get_dt(&button_b);
+  if (second_b < 0)
+    return second_b;
+  if (first != second || first_b != second_b)
     return -EAGAIN;
 
   const long temperature_centi = std::lround(sensor_value_to_double(&temperature) * 100.0);
@@ -73,8 +91,14 @@ static int sample(microbit_bthome::Reading &reading) {
       acceleration_milli < 0 || acceleration_milli > UINT16_MAX)
     return -ERANGE;
 
+  uint16_t heading_centi = 0;
+  if (!microbit_bthome::magnetic_heading(
+          sensor_value_to_double(&magnetic_axes[0]) - MAGNETIC_X_OFFSET_GAUSS,
+          sensor_value_to_double(&magnetic_axes[1]) - MAGNETIC_Y_OFFSET_GAUSS, heading_centi))
+    return -ERANGE;
+
   reading = {static_cast<int16_t>(temperature_centi), second != 0,
-             static_cast<uint16_t>(acceleration_milli)};
+             static_cast<uint16_t>(acceleration_milli), second_b != 0, heading_centi};
   return 0;
 }
 
@@ -94,12 +118,15 @@ static int advertise(const microbit_bthome::Reading &reading) {
 }
 
 int main() {
-  if (!device_is_ready(temperature_sensor) || !device_is_ready(accelerometer) ||
-      !gpio_is_ready_dt(&button_a)) {
+    if (!device_is_ready(temperature_sensor) || !device_is_ready(accelerometer) ||
+      !device_is_ready(magnetometer) || !gpio_is_ready_dt(&button_a) ||
+      !gpio_is_ready_dt(&button_b)) {
     LOG_ERR("Sensor/GPIO not ready; check board revision and accelerometer model");
     return -ENODEV;
   }
   int error = gpio_pin_configure_dt(&button_a, GPIO_INPUT | GPIO_PULL_UP);
+  if (error == 0)
+    error = gpio_pin_configure_dt(&button_b, GPIO_INPUT | GPIO_PULL_UP);
   if (error != 0) {
     LOG_ERR("Button configuration failed: %d", error);
     return error;
