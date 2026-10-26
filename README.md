@@ -1,0 +1,236 @@
+# micro:bit v2 to ESPHome over BTHome V2
+
+Zephyr C++ transmitter and ESP32 passive BLE receiver. No pairing, GATT
+connection, SoftDevice or Bluetooth proxy is involved. Add the ESP32 to Home
+Assistant through the ESPHome integration to discover the three entities.
+
+## Compatibility
+
+- Firmware: **Zephyr 4.2.0**, **Zephyr SDK 0.17.2**, **CMake 3.31.6**,
+  board `bbc_microbit_v2/nrf52833`. Uses Zephyr's Bluetooth controller/host.
+- Hardware: micro:bit v2 with **LSM303AGR** accelerometer, as defined by the
+  upstream Zephyr board. The alternate **FXOS8700** fitting is not supported by
+  this configuration. Check the fitted chip before deploying; a missing sensor
+  is a startup error, not a fabricated zero reading.
+- Gateway: **ESPHome 2026.10.0**, original ESP32 development board (`esp32dev`),
+  ESP-IDF framework. ESP32-S2 has no Bluetooth and cannot be used.
+- Standard micro:bit MicroPython does **not** expose the standard `bluetooth`
+  BLE API alongside `microbit`; this is why the firmware uses Zephyr C++.
+- ESPHome 2026.10.0 has no upstream `bthome` platform. The supplied
+  **local external component** implements the sensor and binary-sensor platforms.
+  Keep `components/bthome` beside the gateway YAML. It is a deliberately strict
+  receiver for this transmitter's profile, not a general BTHome decoder.
+
+## Part 1: Firmware
+
+Implementation: [firmware/src/main.cpp](firmware/src/main.cpp), configuration:
+[firmware/prj.conf](firmware/prj.conf), packet format:
+[components/bthome/protocol.h](components/bthome/protocol.h).
+
+### Exact advertising bytes
+
+Example: 25.00 degrees C, Button A held, total acceleration 9.807 m/s^2:
+
+```text
+02 01 06  0C 16 D2 FC 40  02 C4 09  0F 01  51 4F 26
+```
+
+| Bytes | Meaning |
+| --- | --- |
+| `02 01 06` | Flags AD: length 2, type 0x01, General Discoverable + no BR/EDR |
+| `0C 16` | Service-data AD: 12 following bytes including type 0x16 |
+| `D2 FC` | BTHome service UUID 0xFCD2, little-endian |
+| `40` | Version 2; unencrypted; regular updates; reserved bits zero |
+| `02 C4 09` | Temperature object 0x02; signed LE int16 2500, factor 0.01 |
+| `0F 01` | Generic boolean object 0x0F; Button A pressed=1, released=0 |
+| `51 4F 26` | Acceleration object 0x51; unsigned LE uint16 9807, factor 0.001 |
+
+Object IDs are ascending. The entire advertisement is **16 bytes**, below the
+legacy BLE 31-byte limit. There is no optional packet-ID object (0x00),
+encryption counter or MIC. Device info 0x40 does not itself encode a counter flag.
+The encoder explicitly constructs both AD elements; the firmware gives their
+type/data fields to Zephyr, which serialises the same length/type bytes on air.
+There is no scan response or separate UUID-list AD element; the UUID is carried
+in service data, which passive scanners can read.
+
+**Why not 0x3A?** That object represents button *events*: `3A 01` is a press;
+`3A 00` means no event, **not release**. A held/released entity needs 0x0F.
+No 0x3A events are transmitted by this implementation.
+
+### Timing and accuracy
+
+- Sample every 5 seconds, then advertise for 600 ms at 100-110 ms intervals,
+  plus BLE's random advertising delay, on channels 37/38/39. Several identical
+  copies improve reception; this is not Bluetooth periodic advertising.
+- Advertising stops between bursts. `k_msleep()` and the tickless idle kernel
+  allow CPU System ON idle sleep, not busy waiting or System OFF. The 1 Hz
+  accelerometer remains enabled; the LED matrix and magnetometer are disabled.
+- Button GPIO is active-low and converted to logical pressed/released by Zephyr.
+  Two matching readings 25 ms apart debounce each sample. A bouncing sample is
+  skipped. **Taps entirely between samples are not captured**; this is a periodic
+  state monitor, not a reliable click-event transport. BLE delivery is best effort.
+- Total acceleration is `sqrt(ax*ax + ay*ay + az*az)` in m/s^2, including gravity:
+  approximately 9.81 at rest, not zero. The accelerometer range is +/-4 g per axis.
+- Temperature is the **nRF die temperature**, not a calibrated ambient sensor.
+  Native resolution is 0.25 degrees C; encoding at 0.01 does not improve it.
+  Calibrate against a reference in the intended enclosure if necessary.
+- Sensor errors skip that transmission. BLE start/stop errors trigger a reboot.
+  Fatal initialisation failures are logged and require fixing the hardware/config.
+
+### Build and flash
+
+Use an activated Python virtual environment with `west`, `cmake==3.31.6`, `ninja`
+and Zephyr's `scripts/requirements-base.txt` installed. Initialise a Zephyr
+workspace at tag `v4.2.0` using the [official setup guide](https://docs.zephyrproject.org/4.2.0/develop/getting_started/index.html).
+For this application the required manifest projects are `hal_nordic`, `cmsis`
+and `cmsis_6`; installing all manifest projects is also supported.
+
+From the Zephyr workspace, install the SDK once:
+
+```sh
+export ZEPHYR_BASE="$PWD/zephyr"
+west update --narrow -o=--depth=1 hal_nordic cmsis cmsis_6
+west sdk install --version 0.17.2 --toolchains arm-zephyr-eabi --install-dir "$HOME/zephyr-sdk-0.17.2"
+export ZEPHYR_SDK_INSTALL_DIR="$HOME/zephyr-sdk-0.17.2"
+```
+
+Stage the project from its root if the source path contains spaces (Zephyr 4.2's
+overlay handling splits such paths). Build outputs should also have no spaces:
+
+```sh
+source_dir=$(mktemp -d /tmp/microbit-source.XXXXXX)
+cp -a firmware components "$source_dir/"
+west build -b bbc_microbit_v2/nrf52833 -d /tmp/microbit-build "$source_dir/firmware"
+west flash -d /tmp/microbit-build --runner pyocd
+```
+
+Install `pyocd` in the same environment for flashing. Alternatively, drag
+`/tmp/microbit-build/zephyr/zephyr.hex` onto the MICROBIT USB mass-storage drive.
+Flashing replaces the existing micro:bit application, including MicroPython.
+
+### MAC address and battery deployment
+
+Open the micro:bit USB serial port at **115200, 8N1** and reset the board:
+
+```sh
+python -m serial.tools.miniterm /dev/ttyACM0 115200
+```
+
+The startup log contains `BTHome MAC: XX:XX:XX:XX:XX:XX (random)`.
+Copy the six octets, without `(random)`, into `microbit_mac` in the gateway YAML.
+The code derives a static-random identity from the nRF factory DEVICEADDR,
+sets the two static-address bits, and uses `BT_LE_ADV_OPT_USE_IDENTITY`.
+It remains stable across resets and builds; it is not a rotating private address.
+
+Once the MAC is recorded, disable the UART and logging for battery use:
+
+```sh
+west build -p always -b bbc_microbit_v2/nrf52833 -d /tmp/microbit-build "$source_dir/firmware" -- -DEXTRA_CONF_FILE=battery.conf
+```
+
+Flash that newly built image. The battery image does not print its MAC. Measure
+whole-board current on battery with USB/debug probes disconnected: the interface
+processor and other board circuitry affect consumption. No battery-life or
+microamp-current claim is made without measurement.
+
+## Part 2: ESP32 Gateway
+
+Configuration: [microbit_gateway.yaml](microbit_gateway.yaml).
+
+1. Copy [secrets.example.yaml](secrets.example.yaml) to `secrets.yaml` and set Wi-Fi
+   credentials and a long unique OTA password. The example API key is public test
+   data: **replace it** with the output of `openssl rand -base64 32`.
+2. Set `microbit_mac` to the serial-reported address. Adjust `board` only if using
+   a different BLE-capable ESP32 board.
+3. Install the tested ESPHome release and validate/build/flash:
+
+```sh
+uv tool install esphome==2026.10.0
+esphome config microbit_gateway.yaml
+esphome run microbit_gateway.yaml
+```
+
+Scanning is passive (`active: false`), with a 300 ms window per 320 ms interval.
+These settings suit a mains-powered gateway; Wi-Fi coexistence still creates
+gaps. No pairing or connection to the micro:bit is attempted.
+
+Entities are packet-driven: no polling `update_interval` applies. Updates are
+expected approximately every 5 seconds; lost bursts can make that longer.
+The button has an additional 30 ms ESPHome `delayed_on_off` filter. After 30
+seconds without a valid packet, numeric values become NaN and Button A's state
+is invalidated rather than retaining a stale pressed/released state indefinitely.
+This marks entity data unknown, not the whole ESPHome node offline.
+
+### MQTT alternative
+
+The supplied configuration uses the encrypted native API. For an MQTT-only
+gateway, remove the `api` block (otherwise its no-client reboot timeout applies)
+and add the following, with the three additional secrets populated:
+
+```yaml
+mqtt:
+  broker: !secret mqtt_broker
+  username: !secret mqtt_username
+  password: !secret mqtt_password
+  discovery: true
+```
+
+ESPHome publishes the same entities and Home Assistant MQTT discovery. This
+minimal alternative uses unencrypted MQTT on port 1883: use only on a trusted
+isolated LAN, or configure broker TLS before wider deployment.
+
+Unencrypted BTHome itself has **no authentication, confidentiality or replay
+protection**. A MAC allowlist is not authentication. Do not use these values for
+security-critical decisions; anyone nearby can read or spoof the advertisements.
+
+## Part 3: Troubleshooting and Verification
+
+- In **nRF Connect**, scan without connecting. Find the serial-reported address
+  (Android), inspect **Service Data UUID 0xFCD2**, and verify that service data
+  starts `40 02`. Some versions display the full 128-bit base UUID. iOS does not
+  expose a peripheral's actual BLE MAC; use micro:bit serial or ESPHome logs for
+  MAC matching, not iOS's peripheral identifier.
+- At the example values, service data is `40 02 C4 09 0F 01 51 4F 26` when the
+  app displays UUID separately, or `D2 FC` followed by those bytes otherwise.
+  Ensure the service-data AD length is `0C`, not `0B`. Check changing orientation,
+  temperature and holding/releasing A across successive five-second samples.
+- Look for `[bthome] Accepted V2 packet: temperature=... button=... acceleration=... RSSI=...`.
+  Raise global logger level to `VERY_VERBOSE` and `bthome` to `VERBOSE` temporarily
+  for the configured-MAC/no-service-data diagnostic. For general discovery use
+  `esp32_ble_tracker: DEBUG` under `logger.logs` (global level at least DEBUG).
+- These are the **actual messages from the supplied component**, not invented
+  upstream BTHome logs:
+
+```text
+Dropped BTHome packet: invalid service-data length (expected 9 bytes after UUID)
+Dropped BTHome packet: unsupported device info (expected unencrypted V2 0x40)
+Dropped BTHome packet: unexpected object layout (expected 02,0F,51)
+Dropped BTHome packet: invalid boolean (expected 0 or 1)
+No valid BTHome packet within stale_timeout; readings unknown
+```
+
+- Wrong-MAC packets are silently ignored. Radio-corrupt packets are normally
+  rejected by the controller CRC check before ESPHome sees them; no application
+  log is guaranteed. Keep the micro:bit nearby, check its startup errors, check
+  the MAC after reset, and keep BTHome data in the advertisement, not scan response.
+- Power off the micro:bit: its entities should become unknown after 30 seconds.
+  Power it back on: the MAC should remain unchanged and all states should recover.
+- On battery, compare debug and battery builds with a current meter. Assess packet
+  reception under real Wi-Fi load before reducing the 600 ms burst length.
+
+### Automated checks and remaining hardware gates
+
+Run the byte-exact, signed-value and malformed-packet tests from this project root:
+
+```sh
+g++ -std=c++17 -Wall -Wextra -Werror -pedantic -fsanitize=address,undefined -I. tests/protocol_test.cpp -o /tmp/microbit-bthome-test
+/tmp/microbit-bthome-test
+```
+
+Verified locally: protocol tests, ESPHome 2026.10.0 schema/code generation and
+full ESP32 compilation, plus Zephyr 4.2.0 micro:bit cross-compilation. A successful
+build is not production certification: physical flashing, on-air interoperability,
+Home Assistant state transitions, RF-loss behaviour and whole-board current must
+be verified on the intended hardware before production use.
+
+Protocol reference: [BTHome V2 format](https://bthome.io/format/).
