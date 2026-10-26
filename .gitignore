@@ -3,3 +3,4 @@
 __pycache__/
 secrets.yaml
 firmware/build/
+firmware-v1/build/

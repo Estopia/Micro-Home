@@ -1,4 +1,4 @@
-// Toolchain: Zephyr v4.2.0 SDK, board bbc_microbit_v2/nrf52833 (not MicroPython).
+// Toolchain: Zephyr v4.2.0 SDK; firmware/ targets v2, firmware-v1/ targets early v1.
 #include "protocol.h"
 #include "compass.h"
 

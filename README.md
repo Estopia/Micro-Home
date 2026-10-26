@@ -1,4 +1,4 @@
-# micro:bit v2 to ESPHome over BTHome V2
+# micro:bit v1/v2 to ESPHome over BTHome V2
 
 Zephyr C++ transmitter and ESP32 passive BLE receiver. No pairing, GATT
 connection, SoftDevice or Bluetooth proxy is involved. Add the ESP32 to Home
@@ -8,8 +8,13 @@ acceleration, Button A, Button B and magnetic compass heading.
 ## Compatibility
 
 - Firmware: **Zephyr 4.2.0**, **Zephyr SDK 0.17.2**, **CMake 3.31.6**,
-  board `bbc_microbit_v2/nrf52833`. Uses Zephyr's Bluetooth controller/host.
-- Hardware: micro:bit v2 with **LSM303AGR** accelerometer, as defined by the
+  boards `bbc_microbit/nrf51822` (v1) and `bbc_microbit_v2/nrf52833` (v2).
+  Uses Zephyr's Bluetooth controller/host, not a preinstalled SoftDevice.
+- V1 hardware: early **v1.3** boards with **MMA8653FC + MAG3110**, DAPLink ID
+  prefix `9900`. Separate application in [firmware-v1/CMakeLists.txt](firmware-v1/CMakeLists.txt),
+  with a local MAG3110 driver and smaller stacks for the nRF51822's 16 KB RAM.
+  Later v1.5 sensor variants are not supported by this target.
+- V2 hardware: micro:bit v2 with **LSM303AGR** accelerometer, as defined by the
   upstream Zephyr board. The alternate **FXOS8700** fitting is not supported by
   this configuration. Check the fitted chip before deploying; a missing sensor
   is a startup error, not a fabricated zero reading.
@@ -22,11 +27,64 @@ acceleration, Button A, Button B and magnetic compass heading.
   Keep `components/bthome` beside the gateway YAML. It is a deliberately strict
   receiver for this transmitter's profile, not a general BTHome decoder.
 
+## Choose and Deploy a Board
+
+Both applications share the tested packet encoder, compass maths and sampling
+loop. Their devicetree, drivers and memory configurations are separate; adding v1
+does not replace the working v2 application in `firmware/`.
+
+After installing the pinned Zephyr toolchain described below, run from this
+repository root with `west` on PATH and `ZEPHYR_BASE` set:
+
+```sh
+bash scripts/microbit.sh v1
+bash scripts/microbit.sh v2
+bash scripts/microbit.sh v1 --battery
+bash scripts/microbit.sh v2 --battery
+```
+
+To build and deploy, explicitly select the revision and its mounted MICROBIT drive:
+
+```sh
+bash scripts/microbit.sh v1 --flash /run/media/jayde/MICROBIT
+bash scripts/microbit.sh v2 --flash /run/media/jayde/MICROBIT
+```
+
+Run only the command matching the connected board. The helper checks DAPLink's
+`DETAILS.TXT`, refuses unknown/mismatched board IDs, and rechecks the identity after
+building. It always builds before copying the matching HEX image. Flashing replaces
+the board's existing application. The helper never flashes the ESP32.
+
+Sources and build outputs are staged under `/tmp/microbit-bthome-build-$UID` to
+avoid Zephyr's path-with-spaces issue. Override with a space-free
+`MICROBIT_BUILD_ROOT`. Each board/profile has its own build directory. Serial
+logging is available at 115200 baud for debug builds, but disabled for battery
+builds. A copied HEX must still be verified through serial startup and BLE.
+
+Verified connected boards:
+
+| Board | Stable BLE MAC | Sensors |
+| --- | --- | --- |
+| v1.3 | `D1:5D:FA:79:AC:F7` | MMA8653FC acceleration, MAG3110 compass, nRF51 die temperature |
+| v2 | `FF:5A:28:C6:79:20` | LSM303AGR acceleration/compass, nRF52 die temperature |
+
+Both send exactly the same extended BTHome V2 profile, so the receiver needs no
+new decoder. To switch the existing gateway to v1, set its BTHome `mac_address`
+to `D1:5D:FA:79:AC:F7` and upload it. This does not happen automatically.
+The private local ESP32 configuration is deliberately not changed or committed.
+To receive both boards simultaneously, configure a second `bthome` hub with a
+different ID/MAC and a second sensor/binary-sensor platform entry using that ID
+and distinct entity names. Do not replace the v2 MAC if both should remain active.
+
 ## Part 1: Firmware
 
 Implementation: [firmware/src/main.cpp](firmware/src/main.cpp), configuration:
 [firmware/prj.conf](firmware/prj.conf), packet format:
 [components/bthome/protocol.h](components/bthome/protocol.h).
+The v1 application builds the same main loop with its own board overlay and
+[MAG3110 driver](firmware-v1/src/mag3110.cpp). Its driver verifies chip ID 0xC4,
+uses 1.25 Hz continuous magnetic sampling, checks data-ready, and converts signed
+big-endian measurements at 0.1 microtesla/count into Zephyr's gauss units.
 
 ### Exact advertising bytes
 
@@ -68,8 +126,10 @@ No 0x3A events are transmitted by this implementation.
   plus BLE's random advertising delay, on channels 37/38/39. Several identical
   copies improve reception; this is not Bluetooth periodic advertising.
 - Advertising stops between bursts. `k_msleep()` and the tickless idle kernel
-  allow CPU System ON idle sleep, not busy waiting or System OFF. The 1 Hz
+  allow CPU System ON idle sleep, not busy waiting or System OFF. The
   accelerometer and magnetometer remain enabled; the LED matrix is disabled.
+  The v2 accelerometer runs at 1 Hz; the v1 uses its MMA8653 driver defaults and
+  a 1.25 Hz MAG3110 compass. The five-second BLE schedule is identical.
 - Both button GPIOs are active-low and converted to logical pressed/released by Zephyr.
   Two matching readings 25 ms apart debounce each sample. A bouncing sample is
   skipped. **Taps entirely between samples are not captured**; this is a periodic
@@ -118,6 +178,10 @@ cp -a firmware components "$source_dir/"
 west build -b bbc_microbit_v2/nrf52833 -d /tmp/microbit-build "$source_dir/firmware"
 west flash -d /tmp/microbit-build --runner pyocd
 ```
+
+These manual commands target v2. For v1, also stage `firmware-v1`, select
+`bbc_microbit/nrf51822` and use the `firmware-v1` application path with a separate
+build directory. The helper above performs those selections and handles staging.
 
 Install `pyocd` in the same environment for flashing. Alternatively, drag
 `/tmp/microbit-build/zephyr/zephyr.hex` onto the MICROBIT USB mass-storage drive.
@@ -250,12 +314,16 @@ Run the byte-exact, signed-value and malformed-packet tests from this project ro
 ```sh
 g++ -std=c++17 -Wall -Wextra -Werror -pedantic -fsanitize=address,undefined -I. tests/protocol_test.cpp -o /tmp/microbit-bthome-test
 /tmp/microbit-bthome-test
+bash tests/build_helper_test.sh
 ```
 
+The helper test uses temporary fake DAPLink drives to verify rejection of wrong
+or unknown board revisions without touching connected hardware.
+
 Verified locally: protocol/compass tests, ESPHome 2026.10.0 schema/code generation,
-full ESP32-C3 compilation, and Zephyr 4.2.0 debug/battery cross-compilation.
-The connected micro:bit has been flashed and an actual extended BLE packet with
-both buttons and heading was received at MAC `FF:5A:28:C6:79:20`.
+full ESP32-C3 compilation, and Zephyr 4.2.0 v1/v2 debug/battery cross-compilation.
+Both micro:bit revisions have been flashed and actual extended BLE packets with
+both buttons and heading received at the MAC addresses listed above.
 The ESP32 has not been uploaded in this step. Home Assistant state transitions,
 physical button transitions, calibrated heading accuracy, RF-loss behaviour and
 whole-board current still require verification before production use.

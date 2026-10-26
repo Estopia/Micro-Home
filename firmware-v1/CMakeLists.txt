@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.20.0)
+find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
+project(microbit_v1_bthome LANGUAGES C CXX)
+target_sources(app PRIVATE ../firmware/src/main.cpp src/mag3110.cpp)
+target_include_directories(app PRIVATE ../components/bthome ../firmware/src)

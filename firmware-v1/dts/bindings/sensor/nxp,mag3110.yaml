@@ -1,0 +1,3 @@
+description: NXP MAG3110 three-axis magnetometer
+compatible: "nxp,mag3110"
+include: [sensor-device.yaml, i2c-device.yaml]

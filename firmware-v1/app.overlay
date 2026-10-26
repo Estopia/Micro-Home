@@ -1,0 +1,17 @@
+/ {
+    aliases {
+        magn0 = &mag3110;
+    };
+};
+
+&led_matrix {
+    status = "disabled";
+};
+
+&i2c0 {
+    mag3110: magnetometer@e {
+        compatible = "nxp,mag3110";
+        reg = <0x0e>;
+        status = "okay";
+    };
+};
